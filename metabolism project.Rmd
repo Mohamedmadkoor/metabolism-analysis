@@ -1,0 +1,369 @@
+---
+title: "metabolism in progenitors GO analysis project"
+output: html_document
+date: "2024-08-01"
+---
+
+```{r}
+# Ensure all necessary libraries are loaded
+library(ggplot2)
+library(Seurat)
+library(pheatmap)
+library(dplyr)
+library(reshape2)
+# Ensure all required libraries are installed and loaded
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# Install necessary Bioconductor packages
+BiocManager::install(c("clusterProfiler", "org.Mm.eg.db", "AnnotationDbi", "DOSE"))
+
+# Load required libraries
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(DOSE)
+
+# Define the function for GO analysis and GSEA plots
+perform_go_analysis <- function(data, celltype, ontology) {
+  # Filter data for the current celltype
+  cell_data <- data[data$celltype == celltype, ]
+  
+  cat("Celltype:", celltype, "\n")
+  cat("Number of unique genes:", length(unique(cell_data$gene)), "\n")
+  cat("Total number of genes:", nrow(cell_data), "\n")
+  cat("Testing ontology ", ontology, "\n")
+  
+  # Convert gene symbols to Entrez IDs
+  log2_fc <- cell_data$avg_log2FC 
+  
+  # Create a named vector of log2 fold changes with gene symbols as names
+  names(log2_fc) <- cell_data$gene
+  
+  # Sort the log2_fc vector in decreasing order
+  log2_fc <- sort(log2_fc, decreasing = TRUE)
+  
+  # Remove any NA gene 
+  log2_fc <- na.omit(log2_fc)
+  
+  # Perform GSEA analysis
+  gsea_results <- gseGO(geneList = log2_fc,
+                        OrgDb = org.Mm.eg.db,
+                        keyType = "SYMBOL",
+                        ont = ontology,
+                        minGSSize = 20,
+                        maxGSSize = 1000,
+                        pvalueCutoff = 0.05,
+                        pAdjustMethod = "BH",
+                        verbose = FALSE)
+  
+  # Check if gsea_results has any results
+  if (length(gsea_results) == 0 || is.null(gsea_results)) {
+    cat("No significant enrichment found for celltype:", celltype, "\n")
+    return(NULL)
+  }
+  
+  # Visualize GSEA plots for the top 10 categories
+  top_n <- 10
+  top_sets <- head(as.data.frame(gsea_results)$Description, top_n)
+  
+  for (i in 1:top_n) {
+    gseaplot(gsea_results, geneSetID = i, title = paste(celltype, "-", top_sets[i]), legendPos = "bottomright")
+  }
+  # Return the gsea_results object
+  return(gsea_results)
+}
+
+# Load the table with differentially expressed genes
+sc_data.all <- read.table("C:\\Users\\user\\Desktop\\PN_subset_Species_specific_differences_per_cluster.csv", sep = ",", header = TRUE)
+
+# Adjust log2FC for mouse reference
+sc_data.all$avg_log2FC <- sc_data.all$avg_log2FC * -1
+
+# Remove genes with 0 expression in mouse
+sc_data <- subset(sc_data.all, pct.1 > 0)
+
+# Capitalize gene names to match keytype SYMBOL
+capwords <- function(s, strict = FALSE) {
+  cap <- function(s) paste(toupper(substring(s, 1, 1)),
+                           {s <- substring(s, 2); if(strict) tolower(s) else s},
+                           sep = "", collapse = " " )
+  sapply(strsplit(s, split = " "), cap, USE.NAMES = !is.null(names(s)))
+}
+
+sc_data$gene <- capwords(tolower(sc_data$gene))
+
+# Get unique cell types
+celltypes <- unique(sc_data$celltype)
+
+# Initialize an empty list to store the gsea_results for each celltype
+gsea_results_list <- list()
+
+
+# Function to sanitize filenames by replacing invalid characters
+sanitize_filename <- function(name) {
+  gsub("[/\\:*?\"<>| ]", "-", name)
+}
+
+# Perform GO analysis and GSEA plots for each cell type
+for (celltype in celltypes) {
+  ontology <- "BP"
+  tryCatch({
+    gsea_results <- perform_go_analysis(sc_data, celltype, ontology)
+    if (!is.null(gsea_results)) {
+      gsea_results_list[[celltype]] <- gsea_results
+      if (!dir.exists("gsea")) {
+        dir.create("gsea")
+      }
+      clean_celltype <- sanitize_filename(celltype)
+      celltype_folder <- file.path("gsea", clean_celltype)
+      if (!dir.exists(celltype_folder)) {
+        dir.create(celltype_folder)
+      }
+      top_n <- 20
+      top_sets <- head(as.data.frame(gsea_results)$Description, top_n)
+      for (i in 1:top_n) {
+        clean_set <- sanitize_filename(top_sets[i])
+        pdf_filename <- file.path(celltype_folder, paste(clean_celltype, "- Rank", i, "-", ontology, "-", clean_set, ".pdf", sep = ""))
+        pdf(pdf_filename)
+        plot <- gseaplot(gsea_results, geneSetID = i, title = paste(celltype, "- Rank", i, "-", ontology, "-", top_sets[i]), legendPos = "bottomright")
+        print(plot)
+        dev.off()
+      }
+    }
+  }, error = function(e) {
+    cat("Skipping cell type", celltype, "due to error:", conditionMessage(e), "\n")
+  })
+}
+
+# Extract the top 20 gene sets for each cell type
+extract_top_gene_sets <- function(gsea_results, n = 20) {
+  gene_sets <- as.data.frame(gsea_results)[1:n, ]
+  gene_sets$Description <- as.character(gene_sets$Description)
+  return(gene_sets)
+}
+
+# Extract the top 20 gene sets for each cell type
+top_gene_sets <- lapply(gsea_results_list, extract_top_gene_sets, n = 50)
+
+# Combine the gene sets and add a cell type column
+top_gene_sets_df <- do.call(rbind, lapply(names(top_gene_sets), function(x) {
+  data.frame(CellType = x, top_gene_sets[[x]])
+}))
+
+# Replace slashes with hyphens in the cell type names
+top_gene_sets_df$CellType <- gsub("/", "-", top_gene_sets_df$CellType)
+
+# Calculate the median NES for each gene set
+median_NES <- aggregate(NES ~ Description, data = top_gene_sets_df, FUN = median)
+
+# Reorder the levels of the Description factor based on the median NES
+top_gene_sets_df$Description <- factor(top_gene_sets_df$Description, levels = unique(median_NES$Description[order(median_NES$NES, decreasing = FALSE)]))
+
+# Plotting the dot plot
+plot <- ggplot(top_gene_sets_df, aes(x = fct_rev(Description), y = CellType, size = abs(-log10(p.adjust)), color = NES)) +
+  geom_point(alpha = 0.8) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8, face = "bold"),  # Rotate x-axis labels and increase text size
+    axis.text.y = element_text(size = 12, face = "bold"),                        # Increase y-axis label text size
+    plot.title = element_text(size = 16, face = "bold"),                         # Increase plot title text size
+    axis.title.x = element_text(size = 14),                                      # Increase x-axis title text size
+    axis.title.y = element_text(size = 14)                                       # Increase y-axis title text size
+  ) +
+  labs(
+    title = "Top 20 gene sets by cell type",
+    x = "Gene Set",
+    y = "Cell Type",
+    size = "log10(p-value)",
+    color = "NES"
+  ) +
+  guides(color = guide_colorbar(title.position = "top", title.hjust = 0.5))
+
+# Save the plot as a PDF file with increased width and height
+ggsave(filename = "C:/Users/user/Desktop/images/top_gene_sets_dotplot_improved.pdf", plot = plot, width = 30, height = 15)
+
+# UPSET PLOT
+
+# Install UpSetR 
+if (!requireNamespace("UpSetR", quietly = TRUE))
+  install.packages("UpSetR")
+
+# Load the UpSetR package
+library(UpSetR)
+
+# Create the UpSet plot
+list_input <- list()
+for (celltype in names(gsea_results_list)) {
+  gsea_results <- gsea_results_list[[celltype]]
+  categories <- as.data.frame(gsea_results)$Description
+  celltype <- gsub("/", "-", celltype)  # Replace slashes with hyphens in the celltype names
+  list_input[[celltype]] <- categories
+}
+
+# Print the list_input to check the structure
+print(list_input)
+
+# Create an UpSet plot using the list_input
+upset_plot <- upset(fromList(list_input), empty.intersections = "on", order.by = "freq", nsets = 14)
+
+# Save the UpSet plot as PNG
+upset_plot_filename <- file.path("C:/Users/user/Desktop/images", "upset_plot.png")
+ggsave(upset_plot_filename, plot = upset_plot, width = 12, height = 10)
+
+
+library(Seurat)
+sc_seurat.sct <- readRDS("C:/Users/user/Desktop/sc_seurat.PN.sct.rds")
+
+
+# Define the relevant keywords for metabolism and translation
+relevant_keywords <- c("cytoplasmic translation", "translation at presynapse", "translation at postsynapse",
+                       "mitochondrial respiratory chain complex assembly", "NADH dehydrogenase complex assembly",
+                       "mitochondrial respiratory chain complex I assembly", "spliceosomal snRNP assembly", 
+                       "protein-RNA complex organization", "protein-RNA complex assembly", 
+                       "respiratory electron transport chain", "establishment of protein localization to mitochondrial membrane",
+                       "protein insertion into membrane", "establishment of protein localization to mitochondrion", 
+                       "ribosome assembly", "ribosomal large subunit assembly")
+
+# Filter the data based on relevant keywords
+filtered_data <- sc_data %>%
+  filter(grepl(paste(relevant_keywords, collapse = "|"), Categories, ignore.case = TRUE))
+
+# Check the filtered data
+print("Head of filtered_data:")
+print(head(filtered_data))
+print("Summary of filtered_data:")
+print(summary(filtered_data))
+print("Dimensions of filtered_data:")
+print(dim(filtered_data))
+
+# Ensure there is enough data for heatmap creation
+if(nrow(filtered_data) > 1 && length(unique(filtered_data$Categories)) > 1) {
+  gene_category_matrix <- table(filtered_data$gene, filtered_data$Categories)
+  
+  # Save the heatmap as a PDF for better quality
+  pdf("C:/Users/user/Desktop/gene_category_heatmap_improved.pdf", width = 15, height = 10)
+  heatmap.2(
+    gene_category_matrix, 
+    trace = "none", 
+    dendrogram = "none", 
+    col = colorRampPalette(c("white", "red"))(n = 299), 
+    margins = c(20, 25),          # Increase margins for better label visibility
+    main = "Heatmap of Gene-Category Relationships",
+    cexRow = 0.7,                 # Increase font size for row labels
+    cexCol = 0.7,                 # Increase font size for column labels
+    srtCol = 45,                  # Rotate column labels
+    adjCol = c(1, 0.5),           # Adjust column label alignment
+    key.title = "Association",    # Title for the color key
+    key.xlab = "Intensity",       # Label for the color key
+    key.ylab = "Count"            # Label for the histogram
+  )
+  dev.off()
+  print("Heatmap saved successfully.")
+} else {
+  print("Not enough data for heatmap. Please check the filtered data.")
+}
+
+# Rank the genes within each pathway and select the top 10
+top_genes_per_pathway <- filtered_data %>%
+  group_by(Categories) %>%
+  arrange(p_val_adj) %>%
+  top_n(-10, p_val_adj)
+
+# Create a matrix for heatmap
+gene_category_matrix <- table(top_genes_per_pathway$gene, top_genes_per_pathway$Categories)
+
+# Save the heatmap as a PDF for better quality
+pdf("C:/Users/user/Desktop/gene_category_heatmap_improved_top10.pdf", width = 15, height = 10)
+pheatmap(gene_category_matrix, 
+         main = "Heatmap of Top Genes in Selected Pathways",
+         fontsize_row = 10,
+         fontsize_col = 10)
+dev.off()
+# Load necessary libraries
+library(dplyr)
+
+# Define the paths to your CSV files
+diff_exp_file <- "C:/Users/user/Desktop/PN_subset_Species_specific_differences_per_cluster.csv"
+gene_pathways_file <- "C:/Users/user/Desktop/basal_progen.csv" # Ensure this is the correct file name and path
+output_file <- "C:/Users/user/Desktop/updated_differential_expression_with_pathways.csv"
+
+# Check if files exist
+if (!file.exists(diff_exp_file)) {
+  stop("Differential expression file not found!")
+}
+if (!file.exists(gene_pathways_file)) {
+  stop("Gene pathways file not found!")
+}
+
+# Define the genes of interest
+genes_of_interest <- c("Rpl13a", "Rpl37", "Rpl13", "Rpl36", "Rps5", "Rpl15", "Rpl26", "Rps11", "Rpl27", "Rpl4", 
+                       "Gemin7", "Snrpg", "Snrpf", "Snrpc", "Lsm4", "Snrpe", "Snrpb", "Snrpd2", "Prpf31", "Snrpd3",
+                       "Ndufs6", "Chchd2", "Ndufc2", "Ndufb9", "Ndufa7", "Immp2l", "Etfb", "Coq7", "Slc25a18", "Sdhb",
+                       "Bax", "Tomm40", "Timm13", "Tomm22", "Bbc3", "Romo1", "Mtch2", "Hsp90aa1", "Pdcd5", "Oxa1l",
+                       "Emc6", "Rab5if", "Tmem147", "Rtp4", "Rpl11", "Rps25", "Rps19", "Rplp0", "Rps27l", "Rps27",
+                       "Mrto4", "Fau", "Rpl23a", "Nop53", "Rpl24", "Mrm2", "Rrs1")
+
+# Convert genes of interest to uppercase
+genes_of_interest_upper <- toupper(genes_of_interest)
+
+# Read the differential expression CSV file
+diff_exp_results <- read.csv(diff_exp_file)
+
+# Convert gene names to uppercase
+diff_exp_results$gene <- toupper(diff_exp_results$gene)
+
+# Read the gene pathways CSV file
+gene_pathways <- read.csv(gene_pathways_file, header = FALSE)
+colnames(gene_pathways) <- c("Pathway", "Gene")
+
+# Convert gene names in pathways data to uppercase
+gene_pathways$Gene <- toupper(gene_pathways$Gene)
+
+# Group pathways by gene
+gene_pathways_grouped <- gene_pathways %>%
+  group_by(Gene) %>%
+  summarize(Pathways = paste(Pathway, collapse = ", "))
+
+# Merge the filtered differential expression data with pathways data
+merged_data <- diff_exp_results %>%
+  filter(gene %in% genes_of_interest_upper) %>%
+  left_join(gene_pathways_grouped, by = c("gene" = "Gene"))
+
+# Save the combined dataframe as a CSV file
+write.csv(merged_data, output_file, row.names = FALSE)
+# Load necessary libraries
+install.packages("ggplot2")
+install.packages("pheatmap")
+install.packages("dplyr")
+install.packages("tidyr")
+
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(tidyr)
+
+# Define the file path for the updated data
+updated_file <- "C:/Users/user/Desktop/updated_differential_expression_with_pathways.csv"
+
+# Read the updated data
+data <- read.csv(updated_file)
+
+
+# Prepare the data for the dot plot
+dot_plot_data <- data %>%
+  select(gene, pct.1, pct.2) %>%
+  pivot_longer(cols = starts_with("pct"), names_to = "pct_type", values_to = "percentage")
+
+# Generate the dot plot
+dot_plot <- ggplot(dot_plot_data, aes(x = gene, y = pct_type, size = percentage)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Dot Plot of Gene Expression", x = "Gene", y = "Percentage")
+ggsave("C:/Users/user/Desktop/dot_plot.pdf", plot = dot_plot, width = 10, height = 8)
+
+
+
+```
+
